@@ -18,12 +18,16 @@ FM 权重 (fm_weight) 控制流匹配损失与预测损失的平衡:
 """
 
 import math
+import os
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Optional, List
 
 from utils.config import FMOptimizerConfig
+
+logger = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────
@@ -393,23 +397,45 @@ class FMOptimizer(nn.Module):
     
     完整流程:
     1. 输入: 精排模型的 embedding (condition)
-    2. FM 模型通过 ODE 求解生成优化 embedding
-    3. 预测头将优化 embedding 映射为 CTR/CVR 预测
+    2. [可选] 输入投影: ranker_dim → data_dim (当精排模型 embedding 维度与 FM data_dim 不匹配时)
+    3. FM 模型通过 ODE 求解生成优化 embedding
+    4. 预测头将优化 embedding 映射为 CTR/CVR 预测
     
     训练损失:
     L_total = fm_weight * L_FM + (1 - fm_weight) * L_BCE
     
-    其中:
-    - L_FM: Flow Matching 流匹配一致性损失 (来自 falcon)
-    - L_BCE: 二元交叉熵预测损失
-    - fm_weight: 控制 FM 优化对 embedding 的影响程度
+    支持加载预训练 FM checkpoint:
+    - 提供 fm_checkpoint 路径时, 加载 falcon 预训练的 FM 权重
+    - FM backbone 可选择冻结 (freeze_fm=True), 仅训练投影层和预测头
     """
 
-    def __init__(self, config: FMOptimizerConfig):
+    def __init__(self, config: FMOptimizerConfig, input_dim: int = None,
+                 fm_checkpoint: str = None, freeze_fm: bool = True):
+        """
+        Args:
+            config: FM 优化器配置
+            input_dim: 精排模型 embedding 的输出维度 (如果与 data_dim 不同, 自动添加投影层)
+            fm_checkpoint: 预训练 FM checkpoint 路径 (如 falcon 的 best_fm.pt)
+            freeze_fm: 加载预训练 FM 时是否冻结 FM backbone (仅训练投影层+预测头)
+        """
         super().__init__()
         self.config = config
+        self.fm_weight = config.fm_weight
 
-        # Flow Matching 模型 (改编自 falcon)
+        # ── 输入投影层 ──
+        # 当精排模型的 embedding 维度 != FM 的 data_dim 时, 需要投影层
+        self.input_dim = input_dim if input_dim is not None else config.data_dim
+        if self.input_dim != config.data_dim:
+            self.input_proj = nn.Sequential(
+                nn.Linear(self.input_dim, config.data_dim),
+                nn.LayerNorm(config.data_dim),
+                nn.ReLU(),
+            )
+            logger.info(f"  输入投影层: {self.input_dim} → {config.data_dim}")
+        else:
+            self.input_proj = nn.Identity()
+
+        # ── Flow Matching 模型 (改编自 falcon) ──
         self.fm_model = FlowMatchingModel(
             data_dim=config.data_dim,
             time_dim=config.time_dim,
@@ -425,7 +451,13 @@ class FMOptimizer(nn.Module):
             transformer_dropout=config.transformer_dropout,
         )
 
-        # 预测头: 优化 embedding → CTR/CVR
+        # ── 加载预训练 FM checkpoint ──
+        self.pretrained_fm = False
+        if fm_checkpoint and os.path.exists(fm_checkpoint):
+            self._load_fm_checkpoint(fm_checkpoint, freeze_fm)
+            self.pretrained_fm = True
+
+        # ── 预测头: 优化 embedding → CTR/CVR ──
         pred_layers = []
         input_dim = config.data_dim
         for hidden_dim in config.pred_hidden_dims:
@@ -439,8 +471,65 @@ class FMOptimizer(nn.Module):
         pred_layers.append(nn.Linear(input_dim, 1))
         self.pred_head = nn.Sequential(*pred_layers)
 
-        # FM 权重
-        self.fm_weight = config.fm_weight
+    def _load_fm_checkpoint(self, checkpoint_path: str, freeze_fm: bool = True):
+        """
+        加载预训练 FM checkpoint (兼容 falcon 格式)。
+        
+        falcon checkpoint 格式:
+        {
+            'model_state_dict': {...},  # FlowMatchingModel 的 state_dict
+            'epoch': int,
+            'loss': float,
+            ...
+        }
+        """
+        logger.info(f"  加载预训练 FM checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+
+        # 兼容不同 checkpoint 格式
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        else:
+            state_dict = checkpoint
+
+        # 加载到 fm_model
+        # 需要处理 key 前缀: falcon 保存的是 FlowMatchingModel 的直接 state_dict
+        # 而 FMOptimizer 中 fm_model 的 key 前缀是 'fm_model.'
+        fm_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith('fm_model.'):
+                # 如果已经有前缀, 直接使用
+                fm_state_dict[key] = value
+            else:
+                # 如果没有前缀, 添加 'fm_model.' 前缀
+                fm_state_dict[f'fm_model.{key}'] = value
+
+        # 尝试加载 (允许部分匹配)
+        load_result = self.load_state_dict(fm_state_dict, strict=False)
+        loaded_keys = len([k for k in self.state_dict().keys() if k.startswith('fm_model.')])
+        matched_keys = loaded_keys - len(load_result.missing_keys) if load_result.missing_keys else loaded_keys
+        logger.info(f"  FM checkpoint 加载: {matched_keys} 个匹配参数")
+
+        if load_result.missing_keys:
+            missing_fm_keys = [k for k in load_result.missing_keys if k.startswith('fm_model.')]
+            if missing_fm_keys:
+                logger.warning(f"  FM 缺失 keys: {missing_fm_keys[:5]}...")
+        if load_result.unexpected_keys:
+            logger.warning(f"  FM 多余 keys: {list(load_result.unexpected_keys)[:5]}...")
+
+        # 冻结 FM backbone
+        if freeze_fm:
+            for param in self.fm_model.parameters():
+                param.requires_grad = False
+            logger.info(f"  FM backbone 已冻结 (freeze_fm=True)")
+            trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+            logger.info(f"  可训练参数量 (仅投影层+预测头): {trainable:,}")
+        else:
+            logger.info(f"  FM backbone 未冻结, 全参数微调")
+
+    def project_input(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """将精排模型 embedding 投影到 FM 的 data_dim"""
+        return self.input_proj(embeddings)
 
     def compute_total_loss(
         self,
@@ -453,28 +542,29 @@ class FMOptimizer(nn.Module):
         L_total = fm_weight * L_FM + (1 - fm_weight) * L_BCE
         
         Args:
-            embeddings: 精排模型提取的 embedding (batch, data_dim)
+            embeddings: 精排模型提取的 embedding (batch, input_dim)
             labels: CTR/CVR 标签 (batch,)
         
         Returns:
             dict with: loss, fm_loss, bce_loss
         """
+        # 投影到 FM data_dim
+        projected = self.project_input(embeddings)
+
         # FM 流匹配损失
         fm_loss_dict = self.fm_model.compute_loss(
-            x_clean=embeddings,
-            condition=embeddings,
+            x_clean=projected,
+            condition=projected,
             time_weight_mode=self.config.time_weight_mode,
             time_weight_scale=self.config.time_weight_scale,
         )
         fm_loss = fm_loss_dict['loss']
 
         # 使用 FM 优化后的 embedding 进行预测
-        # 训练时: 直接使用原始 embedding 通过预测头 (因为 FM ODE 求解开销大)
-        # 但计算一个 "FM guided" 的预测作为辅助信号
         optimized_emb = self.fm_model.optimize_embedding(
-            embeddings,
-            delta_t=0.3,  # 较小的 delta_t 保持稳定性
-            num_steps=20,  # 训练时用较少步数
+            projected,
+            delta_t=0.3,
+            num_steps=20,
         )
         pred = self.pred_head(optimized_emb).squeeze(-1)
         pred = torch.sigmoid(pred)
@@ -500,24 +590,27 @@ class FMOptimizer(nn.Module):
         delta_t: float = 0.5,
     ) -> torch.Tensor:
         """
-        完整推理: embedding → FM 优化 → CTR 预测
+        完整推理: embedding → 投影 → FM 优化 → CTR 预测
         
         Args:
-            embeddings: 精排模型提取的 embedding (batch, data_dim)
+            embeddings: 精排模型提取的 embedding (batch, input_dim)
             num_steps: ODE 步数
             delta_t: 流动步长
         
         Returns:
             prediction: (batch,) CTR/CVR 预测概率
         """
-        # Step 1: FM 优化 embedding
+        # Step 1: 投影到 FM data_dim
+        projected = self.project_input(embeddings)
+
+        # Step 2: FM 优化 embedding
         optimized_emb = self.fm_model.optimize_embedding(
-            embeddings,
+            projected,
             delta_t=delta_t,
             num_steps=num_steps,
         )
 
-        # Step 2: 预测头
+        # Step 3: 预测头
         logit = self.pred_head(optimized_emb).squeeze(-1)
         return torch.sigmoid(logit)
 
@@ -530,6 +623,7 @@ class FMOptimizer(nn.Module):
         """
         仅提取 FM 优化后的 embedding (不进行预测)。
         """
+        projected = self.project_input(embeddings)
         return self.fm_model.optimize_embedding(
-            embeddings, delta_t=delta_t, num_steps=num_steps
+            projected, delta_t=delta_t, num_steps=num_steps
         )

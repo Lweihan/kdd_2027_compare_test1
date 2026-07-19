@@ -245,6 +245,7 @@ class CompareTrainer:
         val_labels: torch.Tensor,
         model_name: str,
         fm_weight: float = 1.0,
+        input_dim: int = None,
     ) -> Tuple[FMOptimizer, Dict]:
         """
         训练 FM 优化器。
@@ -256,6 +257,7 @@ class CompareTrainer:
             val_labels: 验证集标签
             model_name: 精排模型名称
             fm_weight: FM 权重
+            input_dim: 精排模型 embedding 维度 (若与 FM data_dim 不同, 自动添加投影层)
         
         Returns:
             (fm_optimizer, training_history)
@@ -263,7 +265,12 @@ class CompareTrainer:
         fm_config = self.config.fm_optimizer
         fm_config.fm_weight = fm_weight  # 使用指定的 fm_weight
 
-        fm_optimizer = FMOptimizer(fm_config).to(self.device)
+        fm_optimizer = FMOptimizer(
+            fm_config,
+            input_dim=input_dim,
+            fm_checkpoint=fm_config.fm_checkpoint if fm_config.fm_checkpoint else None,
+            freeze_fm=fm_config.freeze_fm,
+        ).to(self.device)
         total_params = sum(p.numel() for p in fm_optimizer.parameters() if p.requires_grad)
         logger.info(f"=== 训练 FM 优化器 (model={model_name}, fm_weight={fm_weight}) ===")
         logger.info(f"  FM 模型可训练参数量: {total_params:,}")
@@ -448,6 +455,10 @@ class CompareTrainer:
             self.extract_embeddings(model, test_loader)
 
         # 对每个 fm_weight 进行实验
+        # 获取精排模型 embedding 输出维度
+        input_dim = train_emb.shape[-1]
+        logger.info(f"  精排模型 embedding 维度: {input_dim}")
+
         for fm_weight in fm_weights:
             logger.info(f"\n--- FM weight = {fm_weight} ---")
 
@@ -459,6 +470,7 @@ class CompareTrainer:
                 val_labels=val_labels,
                 model_name=model_name,
                 fm_weight=fm_weight,
+                input_dim=input_dim,
             )
 
             # 评估 FM 优化后的预测效果

@@ -84,6 +84,12 @@ def main():
                         help="目标归因机制")
     parser.add_argument("--data_path", type=str, default=None,
                         help="本地数据路径 (git clone 后的目录, 如: ./data)")
+    parser.add_argument("--fm_checkpoint", type=str, default=None,
+                        help="预训练 FM checkpoint 路径 (如 falcon 的 best_fm.pt)")
+    parser.add_argument("--freeze_fm", action="store_true", default=False,
+                        help="加载预训练 FM 时冻结 FM backbone (仅训练投影层+预测头)")
+    parser.add_argument("--no_freeze_fm", action="store_true", default=False,
+                        help="不冻结 FM backbone, 全参数微调")
     parser.add_argument("--output_dir", type=str, default=None,
                         help="输出目录")
     parser.add_argument("--max_samples", type=int, default=None,
@@ -115,6 +121,12 @@ def main():
         config.seed = args.seed
     if args.device:
         config.device = args.device
+    if args.fm_checkpoint:
+        config.fm_optimizer.fm_checkpoint = args.fm_checkpoint
+    if args.no_freeze_fm:
+        config.fm_optimizer.freeze_fm = False
+    elif args.freeze_fm:
+        config.fm_optimizer.freeze_fm = True
 
     device = config.resolve_device()
     set_seed(config.seed)
@@ -127,6 +139,9 @@ def main():
     logger.info(f"目标归因: {config.dataset.target_attribution}")
     logger.info(f"精排模型: {selected_models}")
     logger.info(f"FM 权重: {args.fm_weights or '使用配置文件默认值'}")
+    logger.info(f"FM checkpoint: {config.fm_optimizer.fm_checkpoint or '无 (从头训练)'}")
+    if config.fm_optimizer.fm_checkpoint:
+        logger.info(f"FM freeze: {config.fm_optimizer.freeze_fm}")
     logger.info(f"设备: {device}")
     logger.info(f"随机种子: {config.seed}")
     logger.info(f"输出目录: {config.output_dir}")
@@ -159,13 +174,22 @@ def main():
     logger.info(f"Embedding 维度: {config.dataset.embed_dim}")
     logger.info(f"特征词表大小: { {k: v for k, v in feature_voc_sizes.items()} }")
 
-    # 更新 FM 优化器的 data_dim 和 cond_dim
+    # 更新 FM 优化器的维度配置
     # 精排模型的 embedding 输出维度 = hidden_dims[-1]
     embed_output_dim = config.models.dnn.hidden_dims[-1]
-    config.fm_optimizer.data_dim = embed_output_dim
-    config.fm_optimizer.cond_dim = embed_output_dim
-    logger.info(f"精排模型 embedding 输出维度: {embed_output_dim}")
-    logger.info(f"FM 优化器 data_dim/cond_dim: {embed_output_dim}")
+
+    if config.fm_optimizer.fm_checkpoint:
+        # 使用预训练 FM checkpoint: 保持 FM 原始架构参数 (data_dim, cond_dim 等)
+        # FMOptimizer 会自动添加 input_proj 将 ranker_dim → fm.data_dim
+        logger.info(f"精排模型 embedding 输出维度: {embed_output_dim}")
+        logger.info(f"FM checkpoint data_dim: {config.fm_optimizer.data_dim}")
+        logger.info(f"  → 将自动添加投影层: {embed_output_dim} → {config.fm_optimizer.data_dim}")
+    else:
+        # 从头训练: FM data_dim 匹配精排模型 embedding 维度
+        config.fm_optimizer.data_dim = embed_output_dim
+        config.fm_optimizer.cond_dim = embed_output_dim
+        logger.info(f"精排模型 embedding 输出维度: {embed_output_dim}")
+        logger.info(f"FM 优化器 data_dim/cond_dim: {embed_output_dim}")
 
     # ──────────────────────────────────────────
     # Step 2: 运行对比实验

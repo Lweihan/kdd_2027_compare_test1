@@ -71,18 +71,22 @@ training:
 # ──────────────────────────────────────────────────
 fm_optimizer:
   # Flow Matching model architecture
-  data_dim: 64               # Must match model embedding output dim
-  time_dim: 64
-  cond_dim: 64               # Must match data_dim
+  # 当使用 falcon 预训练 checkpoint 时, 必须与 falcon 配置一致:
+  #   data_dim=256, time_dim=128, cond_dim=256,
+  #   transformer_dim=1024, transformer_depth=8, transformer_heads=8
+  # 从头训练时, data_dim/cond_dim 自动匹配精排模型 embedding 维度
+  data_dim: 256
+  time_dim: 128
+  cond_dim: 256
   backbone_type: "transformer"  # transformer / mlp
   # MLP backbone params
-  hidden_dim: 256
-  num_layers: 4
+  hidden_dim: 512
+  num_layers: 6
   dropout: 0.1
-  # Transformer backbone params
-  transformer_dim: 256
-  transformer_depth: 4
-  transformer_heads: 4
+  # Transformer backbone params (与 falcon 一致)
+  transformer_dim: 1024
+  transformer_depth: 8
+  transformer_heads: 8
   transformer_mlp_ratio: 4.0
   transformer_dropout: 0.1
   # ODE sampling
@@ -103,6 +107,9 @@ fm_optimizer:
   fm_grad_clip: 1.0
   fm_batch_size: 4096
   fm_ema_loss_alpha: 0.1
+  # Pretrained FM checkpoint (from falcon)
+  fm_checkpoint: ""            # e.g., /path/to/best_fm.pt
+  freeze_fm: true              # Freeze FM backbone when loading pretrained checkpoint
 
 # ──────────────────────────────────────────────────
 # Evaluation Configuration

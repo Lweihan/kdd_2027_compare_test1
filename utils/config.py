@@ -98,6 +98,9 @@ class FMOptimizerConfig:
     fm_grad_clip: float = 1.0
     fm_batch_size: int = 4096
     fm_ema_loss_alpha: float = 0.1
+    # 预训练 FM checkpoint (来自 falcon)
+    fm_checkpoint: str = ""
+    freeze_fm: bool = True
 
 
 @dataclass
