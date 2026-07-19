@@ -54,18 +54,25 @@ def create_model(model_name: str, config: CompareConfig, sparse_feature_names, f
     model_config = getattr(config.models, model_name)
     model_cls = MODEL_REGISTRY[model_name]
 
-    return model_cls(
-        sparse_feature_names=sparse_feature_names,
-        feature_voc_sizes=feature_voc_sizes,
-        embed_dim=config.dataset.embed_dim,
-        hidden_dims=model_config.hidden_dims,
-        dropout=model_config.dropout,
-        activation=model_config.activation,
-        num_cross_layers=model_config.num_cross_layers,
-        num_attention_layers=model_config.num_attention_layers,
-        num_heads=model_config.num_heads,
-        attention_dim=model_config.attention_dim,
-    )
+    # 通用参数 (所有模型都接受)
+    common_kwargs = {
+        "sparse_feature_names": sparse_feature_names,
+        "feature_voc_sizes": feature_voc_sizes,
+        "embed_dim": config.dataset.embed_dim,
+        "hidden_dims": model_config.hidden_dims,
+        "dropout": model_config.dropout,
+        "activation": model_config.activation,
+    }
+
+    # 模型特有参数
+    if model_name == "dcn":
+        common_kwargs["num_cross_layers"] = model_config.num_cross_layers
+    elif model_name == "autoint":
+        common_kwargs["num_attention_layers"] = model_config.num_attention_layers
+        common_kwargs["num_heads"] = model_config.num_heads
+        common_kwargs["attention_dim"] = model_config.attention_dim
+
+    return model_cls(**common_kwargs)
 
 
 def main():
