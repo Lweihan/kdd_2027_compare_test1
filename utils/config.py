@@ -6,8 +6,29 @@ config.py — 统一配置管理
 
 import os
 import yaml
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, fields
 from typing import Optional, List, Dict
+
+
+def _coerce_types(dataclass_cls, kwargs: dict) -> dict:
+    """
+    将 dict 中的值强制转换为 dataclass 字段声明的类型。
+    解决 PyYAML 将 '1e-5' 解析为字符串而非浮点数的问题。
+    """
+    coerced = {}
+    type_map = {int: int, float: float, str: str, bool: bool}
+    field_types = {f.name: f.type for f in fields(dataclass_cls)}
+
+    for key, value in kwargs.items():
+        if key in field_types:
+            target_type = type_map.get(field_types[key])
+            if target_type and value is not None:
+                try:
+                    value = target_type(value)
+                except (ValueError, TypeError):
+                    pass  # 保留原始值
+        coerced[key] = value
+    return coerced
 
 
 @dataclass
@@ -145,18 +166,18 @@ class CompareConfig:
 
     @classmethod
     def from_dict(cls, d: dict) -> "CompareConfig":
-        dataset = DatasetConfig(**d.get("dataset", {}))
+        dataset = DatasetConfig(**_coerce_types(DatasetConfig, d.get("dataset", {})))
         models_d = d.get("models", {})
         models = ModelsConfig(
-            dnn=ModelConfig(**models_d.get("dnn", {})),
-            wide_deep=ModelConfig(**models_d.get("wide_deep", {})),
-            deepfm=ModelConfig(**models_d.get("deepfm", {})),
-            dcn=ModelConfig(**models_d.get("dcn", {})),
-            autoint=ModelConfig(**models_d.get("autoint", {})),
+            dnn=ModelConfig(**_coerce_types(ModelConfig, models_d.get("dnn", {}))),
+            wide_deep=ModelConfig(**_coerce_types(ModelConfig, models_d.get("wide_deep", {}))),
+            deepfm=ModelConfig(**_coerce_types(ModelConfig, models_d.get("deepfm", {}))),
+            dcn=ModelConfig(**_coerce_types(ModelConfig, models_d.get("dcn", {}))),
+            autoint=ModelConfig(**_coerce_types(ModelConfig, models_d.get("autoint", {}))),
         )
-        training = TrainingConfig(**d.get("training", {}))
-        fm_optimizer = FMOptimizerConfig(**d.get("fm_optimizer", {}))
-        evaluation = EvaluationConfig(**d.get("evaluation", {}))
+        training = TrainingConfig(**_coerce_types(TrainingConfig, d.get("training", {})))
+        fm_optimizer = FMOptimizerConfig(**_coerce_types(FMOptimizerConfig, d.get("fm_optimizer", {})))
+        evaluation = EvaluationConfig(**_coerce_types(EvaluationConfig, d.get("evaluation", {})))
         return cls(
             seed=d.get("seed", 42),
             output_dir=d.get("output_dir", "./output"),
