@@ -1,0 +1,535 @@
+"""
+fm_optimizer.py — FM (Flow Matching) Embedding 优化器
+=======================================================
+改编自 falcon 的 Flow Matching Teacher 模型，用于优化精排模型的 embedding。
+
+核心思想:
+1. 精排模型提取初始 embedding → FM 学习 embedding 空间的流形结构
+2. FM 通过 ODE 求解生成 "优化" 后的 embedding
+3. 优化的 embedding 更适合下游 CTR/CVR 预测任务
+
+与 falcon 的对应关系:
+- falcon: condition(当前 embedding) → FM → 预测未来 embedding
+- 本模块: condition(精排模型 embedding) → FM → 优化的 embedding → CTR 预测
+
+FM 权重 (fm_weight) 控制流匹配损失与预测损失的平衡:
+- fm_weight ↑: 更关注 embedding 空间的流形结构
+- fm_weight ↓: 更关注下游预测任务
+"""
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Dict, Optional, List
+
+from utils.config import FMOptimizerConfig
+
+
+# ──────────────────────────────────────────────────
+# Flow Matching 核心数学 (来自 falcon/fm/flow_core.py)
+# ──────────────────────────────────────────────────
+
+def flow_match_forward(
+    x_clean: torch.Tensor,
+    t: torch.Tensor,
+    noise: torch.Tensor = None,
+) -> tuple:
+    """
+    OT-CFM 前向过程 (来自 falcon):
+        x_t = (1 - t) * x_clean + t * noise
+        v_t = noise - x_clean
+
+    Args:
+        x_clean: (batch, dim) 干净 embedding
+        t: (batch,) 时间步 [0, 1]
+        noise: (batch, dim) 噪声
+
+    Returns:
+        x_t: (batch, dim) 加噪后状态
+        v_t: (batch, dim) 真实速度场
+    """
+    if noise is None:
+        noise = torch.randn_like(x_clean)
+    t = t.view(-1, 1)
+    x_t = (1.0 - t) * x_clean + t * noise
+    v_t = noise - x_clean
+    return x_t, v_t
+
+
+# ──────────────────────────────────────────────────
+# 时间编码 (来自 falcon/fm/velocity_net.py)
+# ──────────────────────────────────────────────────
+
+class SinusoidalTimeEmbedding(nn.Module):
+    """正弦时间编码 (来自 falcon)"""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        device = t.device
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = t[:, None] * emb[None, :]
+        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
+        if self.dim % 2 == 1:
+            emb = F.pad(emb, (0, 1))
+        return emb
+
+
+# ──────────────────────────────────────────────────
+# 速度场网络 (改编自 falcon/fm/velocity_net.py)
+# ──────────────────────────────────────────────────
+
+class ResidualBlock(nn.Module):
+    """残差块 (来自 falcon)"""
+
+    def __init__(self, hidden_dim: int, dropout: float = 0.1):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim), nn.Dropout(dropout),
+        )
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(x + self.block(x))
+
+
+class VelocityNetwork(nn.Module):
+    """
+    速度场预测网络 v_θ(x_t, t, condition) — MLP 版本 (来自 falcon)。
+    """
+
+    def __init__(
+        self,
+        data_dim: int = 64,
+        time_dim: int = 64,
+        cond_dim: int = 64,
+        hidden_dim: int = 256,
+        num_layers: int = 4,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.data_dim = data_dim
+
+        self.time_embed = nn.Sequential(
+            SinusoidalTimeEmbedding(time_dim),
+            nn.Linear(time_dim, time_dim), nn.SiLU(),
+            nn.Linear(time_dim, time_dim),
+        )
+        self.cond_proj = nn.Sequential(
+            nn.Linear(cond_dim, hidden_dim), nn.SiLU(),
+        )
+
+        input_dim = data_dim + time_dim + hidden_dim
+
+        layers = [nn.Linear(input_dim, hidden_dim), nn.SiLU(), nn.Dropout(dropout)]
+        for _ in range(num_layers - 2):
+            layers.append(ResidualBlock(hidden_dim, dropout))
+        layers.extend([nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, data_dim)])
+
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, x_t: torch.Tensor, t: torch.Tensor, condition: torch.Tensor = None) -> torch.Tensor:
+        batch_size = x_t.size(0)
+        device = x_t.device
+
+        time_emb = self.time_embed(t)
+        cond_emb = self.cond_proj(condition) if condition is not None else \
+            torch.zeros(batch_size, self.cond_proj[0].out_features, device=device)
+
+        h = torch.cat([x_t, time_emb, cond_emb], dim=-1)
+        return self.mlp(h)
+
+
+class TransformerVelocityNetwork(nn.Module):
+    """
+    速度场预测网络 v_θ(x_t, t, condition) — Transformer 版本 (来自 falcon)。
+    """
+
+    def __init__(
+        self,
+        data_dim: int = 64,
+        time_dim: int = 64,
+        cond_dim: int = 64,
+        transformer_dim: int = 256,
+        depth: int = 4,
+        heads: int = 4,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.data_dim = data_dim
+        self.transformer_dim = transformer_dim
+
+        self.time_embed = nn.Sequential(
+            SinusoidalTimeEmbedding(time_dim),
+            nn.Linear(time_dim, transformer_dim), nn.SiLU(),
+            nn.Linear(transformer_dim, transformer_dim),
+        )
+
+        self.x_proj = nn.Linear(data_dim, transformer_dim)
+        self.cond_proj = nn.Linear(cond_dim, transformer_dim)
+
+        self.type_embed = nn.Parameter(torch.randn(3, transformer_dim) * 0.02)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=transformer_dim,
+            nhead=heads,
+            dim_feedforward=int(transformer_dim * mlp_ratio),
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=depth,
+            norm=nn.LayerNorm(transformer_dim),
+        )
+
+        self.norm_out = nn.LayerNorm(transformer_dim)
+        self.head = nn.Sequential(
+            nn.Linear(transformer_dim, transformer_dim),
+            nn.GELU(),
+            nn.Linear(transformer_dim, data_dim),
+        )
+
+    def forward(self, x_t: torch.Tensor, t: torch.Tensor, condition: torch.Tensor = None) -> torch.Tensor:
+        batch_size = x_t.size(0)
+        device = x_t.device
+
+        x_tok = self.x_proj(x_t)
+        t_tok = self.time_embed(t)
+        c_tok = self.cond_proj(condition) if condition is not None else \
+            torch.zeros(batch_size, self.transformer_dim, device=device)
+
+        tokens = torch.stack([x_tok, t_tok, c_tok], dim=1)
+        tokens = tokens + self.type_embed.unsqueeze(0)
+
+        h = self.transformer(tokens)
+        out = self.norm_out(h[:, 0])
+        v_pred = self.head(out)
+
+        return v_pred
+
+
+# ──────────────────────────────────────────────────
+# Flow Matching 模型 (改编自 falcon/fm/model.py)
+# ──────────────────────────────────────────────────
+
+class FlowMatchingModel(nn.Module):
+    """
+    Flow Matching Embedding 优化模型 (改编自 falcon)。
+    
+    训练: compute_loss(x_clean, condition, time_weight_mode, time_weight_scale)
+    推理: sample(condition) / optimize_embedding(condition, num_steps)
+    """
+
+    def __init__(
+        self,
+        data_dim: int = 64,
+        time_dim: int = 64,
+        cond_dim: int = 64,
+        hidden_dim: int = 256,
+        num_layers: int = 4,
+        dropout: float = 0.1,
+        backbone_type: str = "transformer",
+        transformer_dim: int = 256,
+        transformer_depth: int = 4,
+        transformer_heads: int = 4,
+        transformer_mlp_ratio: float = 4.0,
+        transformer_dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.data_dim = data_dim
+        self.backbone_type = backbone_type
+
+        if backbone_type == "transformer":
+            self.velocity_net = TransformerVelocityNetwork(
+                data_dim=data_dim, time_dim=time_dim, cond_dim=cond_dim,
+                transformer_dim=transformer_dim, depth=transformer_depth,
+                heads=transformer_heads, mlp_ratio=transformer_mlp_ratio,
+                dropout=transformer_dropout,
+            )
+        elif backbone_type == "mlp":
+            self.velocity_net = VelocityNetwork(
+                data_dim=data_dim, time_dim=time_dim, cond_dim=cond_dim,
+                hidden_dim=hidden_dim, num_layers=num_layers, dropout=dropout,
+            )
+        else:
+            raise ValueError(f"Unknown backbone_type: {backbone_type}")
+
+    @staticmethod
+    def compute_time_weights(t: torch.Tensor, mode: str = "mid", scale: float = 1.0) -> torch.Tensor:
+        """
+        计算时间步加权函数 w(t) (来自 falcon)。
+        """
+        if mode == "none" or scale == 0.0:
+            return torch.ones_like(t)
+
+        if mode == "mid":
+            w = 1.0 + scale * 4.0 * t * (1.0 - t)
+        elif mode == "late":
+            w = 1.0 + scale * 2.0 * t
+        elif mode == "early":
+            w = 1.0 + scale * 2.0 * (1.0 - t)
+        else:
+            raise ValueError(f"Unknown time_weight_mode: {mode}")
+
+        return w
+
+    def compute_loss(
+        self,
+        x_clean: torch.Tensor,
+        condition: torch.Tensor = None,
+        time_weight_mode: str = "mid",
+        time_weight_scale: float = 1.0,
+    ) -> dict:
+        """
+        Flow Matching 训练损失: w(t) * ||v_pred - v_t||^2 (来自 falcon)。
+        """
+        batch_size = x_clean.size(0)
+        device = x_clean.device
+
+        t = torch.rand(batch_size, device=device)
+        noise = torch.randn_like(x_clean)
+        x_t, v_t = flow_match_forward(x_clean, t, noise)
+        v_pred = self.velocity_net(x_t, t, condition)
+
+        per_sample_mse = F.mse_loss(v_pred, v_t, reduction='none').mean(dim=-1)
+        mse_raw = per_sample_mse.mean()
+
+        w = self.compute_time_weights(t, mode=time_weight_mode, scale=time_weight_scale)
+        mse_weighted = (w * per_sample_mse).mean()
+
+        return {
+            'loss': mse_weighted,
+            'mse_raw': mse_raw.item(),
+            'mse_weighted': mse_weighted.item(),
+            'time_weight_mean': w.mean().item(),
+            't_mean': t.mean().item(),
+        }
+
+    @torch.no_grad()
+    def sample(
+        self,
+        condition: torch.Tensor,
+        num_steps: int = 50,
+        method: str = 'euler',
+        device: str = 'cpu',
+    ) -> torch.Tensor:
+        """从噪声生成优化 embedding (ODE: t=1→0) (来自 falcon)"""
+        batch_size = condition.size(0)
+        x = torch.randn(batch_size, self.data_dim, device=device)
+        dt = 1.0 / num_steps
+
+        if method == 'euler':
+            for step in range(num_steps):
+                t_val = 1.0 - step * dt
+                t = torch.full((batch_size,), t_val, device=device)
+                v = self.velocity_net(x, t, condition)
+                x = x - v * dt
+        elif method == 'rk4':
+            for step in range(num_steps):
+                t_val = 1.0 - step * dt
+                t = torch.full((batch_size,), t_val, device=device)
+                k1 = self.velocity_net(x, t, condition)
+                k2 = self.velocity_net(x - 0.5 * dt * k1, t - 0.5 * dt, condition)
+                k3 = self.velocity_net(x - 0.5 * dt * k2, t - 0.5 * dt, condition)
+                k4 = self.velocity_net(x - dt * k3, t - dt, condition)
+                x = x - (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+        else:
+            raise ValueError(f"Unknown ODE method: {method}")
+        return x
+
+    @torch.no_grad()
+    def optimize_embedding(
+        self,
+        condition: torch.Tensor,
+        delta_t: float = 0.5,
+        num_steps: int = 50,
+        method: str = 'euler',
+    ) -> torch.Tensor:
+        """
+        优化 embedding (改编自 falcon 的 predict_future_embedding)。
+        
+        从精排模型的 embedding (condition) 出发，通过 Flow Matching 生成优化后的 embedding。
+        
+        Args:
+            condition: 精排模型的 embedding, (batch, data_dim)
+            delta_t: 流动步长 [0, 1]
+            num_steps: ODE 步数
+            method: euler / rk4
+        
+        Returns:
+            optimized_emb: (batch, data_dim) 优化后的 embedding
+        """
+        batch_size = condition.size(0)
+        device = condition.device
+
+        noise = torch.randn_like(condition)
+        x_t = (1.0 - delta_t) * condition + delta_t * noise
+
+        dt = delta_t / num_steps
+        for step in range(num_steps):
+            t_val = delta_t - step * dt
+            t = torch.full((batch_size,), t_val, device=device)
+            v = self.velocity_net(x_t, t, condition)
+            x_t = x_t - v * dt
+        return x_t
+
+
+# ──────────────────────────────────────────────────
+# FM Optimizer 完整封装
+# ──────────────────────────────────────────────────
+
+class FMOptimizer(nn.Module):
+    """
+    FM (Flow Matching) Embedding 优化器。
+    
+    完整流程:
+    1. 输入: 精排模型的 embedding (condition)
+    2. FM 模型通过 ODE 求解生成优化 embedding
+    3. 预测头将优化 embedding 映射为 CTR/CVR 预测
+    
+    训练损失:
+    L_total = fm_weight * L_FM + (1 - fm_weight) * L_BCE
+    
+    其中:
+    - L_FM: Flow Matching 流匹配一致性损失 (来自 falcon)
+    - L_BCE: 二元交叉熵预测损失
+    - fm_weight: 控制 FM 优化对 embedding 的影响程度
+    """
+
+    def __init__(self, config: FMOptimizerConfig):
+        super().__init__()
+        self.config = config
+
+        # Flow Matching 模型 (改编自 falcon)
+        self.fm_model = FlowMatchingModel(
+            data_dim=config.data_dim,
+            time_dim=config.time_dim,
+            cond_dim=config.cond_dim,
+            hidden_dim=config.hidden_dim,
+            num_layers=config.num_layers,
+            dropout=config.dropout,
+            backbone_type=config.backbone_type,
+            transformer_dim=config.transformer_dim,
+            transformer_depth=config.transformer_depth,
+            transformer_heads=config.transformer_heads,
+            transformer_mlp_ratio=config.transformer_mlp_ratio,
+            transformer_dropout=config.transformer_dropout,
+        )
+
+        # 预测头: 优化 embedding → CTR/CVR
+        pred_layers = []
+        input_dim = config.data_dim
+        for hidden_dim in config.pred_hidden_dims:
+            pred_layers.extend([
+                nn.Linear(input_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(config.pred_dropout),
+            ])
+            input_dim = hidden_dim
+        pred_layers.append(nn.Linear(input_dim, 1))
+        self.pred_head = nn.Sequential(*pred_layers)
+
+        # FM 权重
+        self.fm_weight = config.fm_weight
+
+    def compute_total_loss(
+        self,
+        embeddings: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> dict:
+        """
+        计算 FM 优化器的总损失。
+        
+        L_total = fm_weight * L_FM + (1 - fm_weight) * L_BCE
+        
+        Args:
+            embeddings: 精排模型提取的 embedding (batch, data_dim)
+            labels: CTR/CVR 标签 (batch,)
+        
+        Returns:
+            dict with: loss, fm_loss, bce_loss
+        """
+        # FM 流匹配损失
+        fm_loss_dict = self.fm_model.compute_loss(
+            x_clean=embeddings,
+            condition=embeddings,
+            time_weight_mode=self.config.time_weight_mode,
+            time_weight_scale=self.config.time_weight_scale,
+        )
+        fm_loss = fm_loss_dict['loss']
+
+        # 使用 FM 优化后的 embedding 进行预测
+        # 训练时: 直接使用原始 embedding 通过预测头 (因为 FM ODE 求解开销大)
+        # 但计算一个 "FM guided" 的预测作为辅助信号
+        optimized_emb = self.fm_model.optimize_embedding(
+            embeddings,
+            delta_t=0.3,  # 较小的 delta_t 保持稳定性
+            num_steps=20,  # 训练时用较少步数
+        )
+        pred = self.pred_head(optimized_emb).squeeze(-1)
+        pred = torch.sigmoid(pred)
+
+        # BCE 损失
+        bce_loss = F.binary_cross_entropy(pred, labels)
+
+        # 总损失
+        total_loss = self.fm_weight * fm_loss + (1 - self.fm_weight) * bce_loss
+
+        return {
+            'loss': total_loss,
+            'fm_loss': fm_loss.item(),
+            'bce_loss': bce_loss.item(),
+            'mse_raw': fm_loss_dict['mse_raw'],
+            'mse_weighted': fm_loss_dict['mse_weighted'],
+        }
+
+    def forward(
+        self,
+        embeddings: torch.Tensor,
+        num_steps: int = 50,
+        delta_t: float = 0.5,
+    ) -> torch.Tensor:
+        """
+        完整推理: embedding → FM 优化 → CTR 预测
+        
+        Args:
+            embeddings: 精排模型提取的 embedding (batch, data_dim)
+            num_steps: ODE 步数
+            delta_t: 流动步长
+        
+        Returns:
+            prediction: (batch,) CTR/CVR 预测概率
+        """
+        # Step 1: FM 优化 embedding
+        optimized_emb = self.fm_model.optimize_embedding(
+            embeddings,
+            delta_t=delta_t,
+            num_steps=num_steps,
+        )
+
+        # Step 2: 预测头
+        logit = self.pred_head(optimized_emb).squeeze(-1)
+        return torch.sigmoid(logit)
+
+    def extract_optimized_embedding(
+        self,
+        embeddings: torch.Tensor,
+        num_steps: int = 50,
+        delta_t: float = 0.5,
+    ) -> torch.Tensor:
+        """
+        仅提取 FM 优化后的 embedding (不进行预测)。
+        """
+        return self.fm_model.optimize_embedding(
+            embeddings, delta_t=delta_t, num_steps=num_steps
+        )

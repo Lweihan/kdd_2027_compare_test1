@@ -1,0 +1,112 @@
+# KDD Compare Test - FM-Optimized Embedding Comparison Experiment
+# ============================================================
+# Compare 5 fine-ranking models: Direct Prediction vs FM-Optimized Embedding Prediction
+
+seed: 42
+output_dir: "./output"
+device: "auto"  # auto / cuda:0 / cpu
+
+# ──────────────────────────────────────────────────
+# Dataset Configuration
+# ──────────────────────────────────────────────────
+dataset:
+  name: "alimamaTech/MAC"    # HuggingFace dataset name
+  target_attribution: "last_click"  # last_click / first_click / dda / linear
+  max_samples: -1             # -1 for full dataset, or set a limit for debugging
+  train_ratio: 0.8
+  batch_size: 4096
+  num_workers: 4
+  # Feature configuration
+  sparse_features: []        # Auto-detected from dataset
+  dense_features: []          # Auto-detected from dataset
+  embed_dim: 16               # Embedding dimension for sparse features
+  sequence_features: false    # Whether to use behavior sequence features
+
+# ──────────────────────────────────────────────────
+# Fine-Ranking Model Configuration
+# ──────────────────────────────────────────────────
+models:
+  dnn:
+    hidden_dims: [256, 128, 64]
+    dropout: 0.1
+    activation: "relu"
+  
+  wide_deep:
+    hidden_dims: [256, 128, 64]
+    dropout: 0.1
+    activation: "relu"
+  
+  deepfm:
+    hidden_dims: [256, 128, 64]
+    dropout: 0.1
+    activation: "relu"
+  
+  dcn:
+    hidden_dims: [256, 128, 64]
+    num_cross_layers: 3
+    dropout: 0.1
+    activation: "relu"
+  
+  autoint:
+    hidden_dims: [256, 128, 64]
+    num_attention_layers: 3
+    num_heads: 4
+    attention_dim: 64
+    dropout: 0.1
+    activation: "relu"
+
+# ──────────────────────────────────────────────────
+# Training Configuration (for fine-ranking models)
+# ──────────────────────────────────────────────────
+training:
+  epochs: 1
+  lr: 0.003
+  weight_decay: 1e-5
+  grad_clip: 5.0
+  early_stop_patience: 2
+  save_every: 1
+
+# ──────────────────────────────────────────────────
+# FM Optimizer Configuration (adapted from falcon)
+# ──────────────────────────────────────────────────
+fm_optimizer:
+  # Flow Matching model architecture
+  data_dim: 64               # Must match model embedding output dim
+  time_dim: 64
+  cond_dim: 64               # Must match data_dim
+  backbone_type: "transformer"  # transformer / mlp
+  # MLP backbone params
+  hidden_dim: 256
+  num_layers: 4
+  dropout: 0.1
+  # Transformer backbone params
+  transformer_dim: 256
+  transformer_depth: 4
+  transformer_heads: 4
+  transformer_mlp_ratio: 4.0
+  transformer_dropout: 0.1
+  # ODE sampling
+  sample_steps: 50
+  sample_method: "euler"      # euler / rk4
+  # Time weighting (from falcon)
+  time_weight_mode: "mid"    # none / mid / late / early
+  time_weight_scale: 1.0
+  # FM loss weight (key parameter: controls how much FM influences optimization)
+  fm_weight: 1.0              # Weight of FM flow matching loss vs prediction loss
+  # Prediction head on FM-optimized embeddings
+  pred_hidden_dims: [128, 64]
+  pred_dropout: 0.1
+  # FM training
+  fm_epochs: 5
+  fm_lr: 1e-3
+  fm_weight_decay: 1e-5
+  fm_grad_clip: 1.0
+  fm_batch_size: 4096
+  fm_ema_loss_alpha: 0.1
+
+# ──────────────────────────────────────────────────
+# Evaluation Configuration
+# ──────────────────────────────────────────────────
+evaluation:
+  metrics: ["auc", "gauc", "logloss", "ndcg"]
+  ndcg_k: 10
