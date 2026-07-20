@@ -570,8 +570,7 @@ class FMOptimizer(nn.Module):
             # 理由: ODE 求解每步需要 N 次 velocity_net forward (N=20)
             #        在 FM backbone 冻结时, ODE 梯度不回传到 FM
             #        pred_head 的梯度通过 projected 直传即可
-            pred = self.pred_head(projected).squeeze(-1)
-            pred = torch.sigmoid(pred)
+            logit = self.pred_head(projected).squeeze(-1)
         else:
             # ── 完整训练: 运行 ODE 求解 ──
             optimized_emb = self.fm_model.optimize_embedding(
@@ -579,11 +578,10 @@ class FMOptimizer(nn.Module):
                 delta_t=self.config.train_delta_t,
                 num_steps=self.config.train_ode_steps,
             )
-            pred = self.pred_head(optimized_emb).squeeze(-1)
-            pred = torch.sigmoid(pred)
+            logit = self.pred_head(optimized_emb).squeeze(-1)
 
-        # BCE 损失
-        bce_loss = F.binary_cross_entropy(pred, labels)
+        # BCE 损失 (使用 with_logits 版本, AMP 安全)
+        bce_loss = F.binary_cross_entropy_with_logits(logit, labels)
 
         # 总损失
         total_loss = self.fm_weight * fm_loss + (1 - self.fm_weight) * bce_loss

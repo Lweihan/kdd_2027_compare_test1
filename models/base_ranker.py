@@ -89,13 +89,13 @@ class BaseRanker(nn.Module):
             sparse_values: {feat_name: (batch,)} 各稀疏特征的整数编码值
         
         Returns:
-            prediction: (batch, 1) 预测概率
+            logits: (batch,) 预测 logit (未经 sigmoid)
         """
         raise NotImplementedError
 
     def predict(self, sparse_values: Dict[str, torch.Tensor]) -> torch.Tensor:
         """预测接口，返回 sigmoid 后的概率"""
-        return self.forward(sparse_values)
+        return torch.sigmoid(self.forward(sparse_values))
 
     def extract_embedding(self, sparse_values: Dict[str, torch.Tensor]) -> torch.Tensor:
         """

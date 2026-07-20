@@ -132,7 +132,11 @@ class DeepFM(BaseRanker):
         fm_second = self.fm_second_order_forward(sparse_values)
         deep_out = self.deep_forward(sparse_values)
         logit = fm_first + fm_second + deep_out
-        return torch.sigmoid(logit)
+        return logit
+
+    def predict(self, sparse_values: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """预测接口，返回 sigmoid 后的概率"""
+        return torch.sigmoid(self.forward(sparse_values))
 
     def extract_embedding(self, sparse_values: Dict[str, torch.Tensor]) -> torch.Tensor:
         """提取 Deep 部分的 embedding"""

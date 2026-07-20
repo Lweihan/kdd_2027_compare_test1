@@ -190,8 +190,8 @@ class CompareTrainer:
             sparse_values = {k: v.to(self.device) for k, v in batch["sparse_values"].items()}
             labels = batch["label"].to(self.device)
 
-            pred = model(sparse_values)
-            loss = F.binary_cross_entropy(pred, labels)
+            pred = model(sparse_values)  # logits (AMP-safe)
+            loss = F.binary_cross_entropy_with_logits(pred, labels)
 
             optimizer.zero_grad()
             loss.backward()
@@ -214,7 +214,8 @@ class CompareTrainer:
 
         for batch in loader:
             sparse_values = {k: v.to(self.device) for k, v in batch["sparse_values"].items()}
-            pred = model(sparse_values)
+            logit = model(sparse_values)  # logits
+            pred = torch.sigmoid(logit)    # → probability
 
             all_preds.append(pred.cpu().numpy())
             all_labels.append(batch["label"].numpy())

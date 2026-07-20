@@ -86,7 +86,11 @@ class WideDeep(BaseRanker):
         wide_out = self.wide_forward(sparse_values)
         deep_out = self.deep_forward(sparse_values)
         logit = wide_out + deep_out
-        return torch.sigmoid(logit)
+        return logit
+
+    def predict(self, sparse_values: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """预测接口，返回 sigmoid 后的概率"""
+        return torch.sigmoid(self.forward(sparse_values))
 
     def extract_embedding(self, sparse_values: Dict[str, torch.Tensor]) -> torch.Tensor:
         """提取 Wide + Deep 联合 embedding"""

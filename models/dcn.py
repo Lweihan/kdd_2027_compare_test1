@@ -118,7 +118,11 @@ class DCN(BaseRanker):
         # 合并 Cross + Deep
         combined = torch.cat([cross_out, deep_out], dim=1)  # (batch, concat_embed_dim + 1)
         logit = self.output_layer(combined).squeeze(-1)
-        return torch.sigmoid(logit)
+        return logit
+
+    def predict(self, sparse_values: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """预测接口，返回 sigmoid 后的概率"""
+        return torch.sigmoid(self.forward(sparse_values))
 
     def extract_embedding(self, sparse_values: Dict[str, torch.Tensor]) -> torch.Tensor:
         """提取 Cross + Deep 联合 embedding"""

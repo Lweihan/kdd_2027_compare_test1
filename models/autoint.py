@@ -161,7 +161,11 @@ class AutoInt(BaseRanker):
 
         # 输出
         logit = self.output_layer(x_flat).squeeze(-1)  # (batch,)
-        return torch.sigmoid(logit)
+        return logit
+
+    def predict(self, sparse_values: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """预测接口，返回 sigmoid 后的概率"""
+        return torch.sigmoid(self.forward(sparse_values))
 
     def extract_embedding(self, sparse_values: Dict[str, torch.Tensor]) -> torch.Tensor:
         """提取 Attention 交互后的 embedding"""

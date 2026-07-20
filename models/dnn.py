@@ -60,7 +60,11 @@ class DNN(BaseRanker):
     def forward(self, sparse_values: Dict[str, torch.Tensor]) -> torch.Tensor:
         concat_embeds = self.embed_input(sparse_values)  # (batch, num_sparse * embed_dim)
         logit = self.mlp(concat_embeds)  # (batch, 1)
-        return torch.sigmoid(logit).squeeze(-1)
+        return logit.squeeze(-1)
+
+    def predict(self, sparse_values: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """预测接口，返回 sigmoid 后的概率"""
+        return torch.sigmoid(self.forward(sparse_values))
 
     def extract_embedding(self, sparse_values: Dict[str, torch.Tensor]) -> torch.Tensor:
         """提取 embedding (拼接后的 embedding 投影到 hidden_dims[-1] 维)"""
