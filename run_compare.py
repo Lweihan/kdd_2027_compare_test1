@@ -97,6 +97,12 @@ def main():
                         help="加载预训练 FM 时冻结 FM backbone (仅训练投影层+预测头)")
     parser.add_argument("--no_freeze_fm", action="store_true", default=False,
                         help="不冻结 FM backbone, 全参数微调")
+    parser.add_argument("--no_fast_train", action="store_true", default=False,
+                        help="禁用快速训练模式 (每步都运行 ODE, 非常慢)")
+    parser.add_argument("--no_amp", action="store_true", default=False,
+                        help="禁用混合精度训练 (AMP)")
+    parser.add_argument("--compile", action="store_true", default=False,
+                        help="启用 torch.compile 加速 velocity_net (需 PyTorch 2.0+)")
     parser.add_argument("--output_dir", type=str, default=None,
                         help="输出目录")
     parser.add_argument("--max_samples", type=int, default=None,
@@ -105,6 +111,10 @@ def main():
                         help="随机种子")
     parser.add_argument("--device", type=str, default=None,
                         help="设备 (cuda:0 / cpu / auto)")
+    parser.add_argument("--multi_gpu", action="store_true", default=False,
+                        help="启用多卡训练 (DataParallel)")
+    parser.add_argument("--gpu_ids", nargs="+", type=int, default=None,
+                        help="指定 GPU IDs (如: --gpu_ids 0 1 2 3)")
     args = parser.parse_args()
 
     # 加载配置
@@ -128,12 +138,22 @@ def main():
         config.seed = args.seed
     if args.device:
         config.device = args.device
+    if args.multi_gpu:
+        config.training.multi_gpu = True
+    if args.gpu_ids is not None:
+        config.training.gpu_ids = args.gpu_ids
     if args.fm_checkpoint:
         config.fm_optimizer.fm_checkpoint = args.fm_checkpoint
     if args.no_freeze_fm:
         config.fm_optimizer.freeze_fm = False
     elif args.freeze_fm:
         config.fm_optimizer.freeze_fm = True
+    if args.no_fast_train:
+        config.fm_optimizer.fast_train = False
+    if args.no_amp:
+        config.fm_optimizer.use_amp = False
+    if args.compile:
+        config.fm_optimizer.compile_velocity = True
 
     device = config.resolve_device()
     set_seed(config.seed)
@@ -150,6 +170,9 @@ def main():
     if config.fm_optimizer.fm_checkpoint:
         logger.info(f"FM freeze: {config.fm_optimizer.freeze_fm}")
     logger.info(f"设备: {device}")
+    logger.info(f"多卡训练: {config.training.multi_gpu}")
+    if config.training.multi_gpu:
+        logger.info(f"GPU IDs: {config.training.gpu_ids if config.training.gpu_ids else '全部可见 GPU'}")
     logger.info(f"随机种子: {config.seed}")
     logger.info(f"输出目录: {config.output_dir}")
 

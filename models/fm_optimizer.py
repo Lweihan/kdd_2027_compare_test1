@@ -535,6 +535,7 @@ class FMOptimizer(nn.Module):
         self,
         embeddings: torch.Tensor,
         labels: torch.Tensor,
+        fast_train: bool = True,
     ) -> dict:
         """
         计算 FM 优化器的总损失。
@@ -544,6 +545,10 @@ class FMOptimizer(nn.Module):
         Args:
             embeddings: 精排模型提取的 embedding (batch, input_dim)
             labels: CTR/CVR 标签 (batch,)
+            fast_train: 快速训练模式 (默认 True)
+                - True: 训练时跳过 ODE 求解, 用 projected embedding 直接通过 pred_head
+                        仅计算 FM velocity loss + 直接预测 BCE loss
+                - False: 每步都运行 ODE 求解 (慢, 但更精确)
         
         Returns:
             dict with: loss, fm_loss, bce_loss
@@ -551,7 +556,7 @@ class FMOptimizer(nn.Module):
         # 投影到 FM data_dim
         projected = self.project_input(embeddings)
 
-        # FM 流匹配损失
+        # FM 流匹配损失 (velocity prediction loss, 无需 ODE)
         fm_loss_dict = self.fm_model.compute_loss(
             x_clean=projected,
             condition=projected,
@@ -560,14 +565,22 @@ class FMOptimizer(nn.Module):
         )
         fm_loss = fm_loss_dict['loss']
 
-        # 使用 FM 优化后的 embedding 进行预测
-        optimized_emb = self.fm_model.optimize_embedding(
-            projected,
-            delta_t=0.3,
-            num_steps=20,
-        )
-        pred = self.pred_head(optimized_emb).squeeze(-1)
-        pred = torch.sigmoid(pred)
+        if fast_train:
+            # ── 快速训练: 跳过 ODE, 直接用 projected embedding 预测 ──
+            # 理由: ODE 求解每步需要 N 次 velocity_net forward (N=20)
+            #        在 FM backbone 冻结时, ODE 梯度不回传到 FM
+            #        pred_head 的梯度通过 projected 直传即可
+            pred = self.pred_head(projected).squeeze(-1)
+            pred = torch.sigmoid(pred)
+        else:
+            # ── 完整训练: 运行 ODE 求解 ──
+            optimized_emb = self.fm_model.optimize_embedding(
+                projected,
+                delta_t=self.config.train_delta_t,
+                num_steps=self.config.train_ode_steps,
+            )
+            pred = self.pred_head(optimized_emb).squeeze(-1)
+            pred = torch.sigmoid(pred)
 
         # BCE 损失
         bce_loss = F.binary_cross_entropy(pred, labels)

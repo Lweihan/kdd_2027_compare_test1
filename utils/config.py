@@ -81,6 +81,9 @@ class TrainingConfig:
     grad_clip: float = 5.0
     early_stop_patience: int = 2
     save_every: int = 1
+    # 多卡训练
+    multi_gpu: bool = False
+    gpu_ids: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -122,6 +125,13 @@ class FMOptimizerConfig:
     # 预训练 FM checkpoint (来自 falcon)
     fm_checkpoint: str = ""
     freeze_fm: bool = True
+    # 训练加速
+    fast_train: bool = True             # 快速训练: 跳过 ODE, 用 projected embedding 直接预测
+    train_delta_t: float = 0.3          # 训练时 ODE 步长 (fast_train=False 时生效)
+    train_ode_steps: int = 10            # 训练时 ODE 步数 (fast_train=False 时生效)
+    eval_interval: int = 1              # 评估间隔 (每 N 个 epoch 评估一次)
+    use_amp: bool = False               # 混合精度训练 (AMP)
+    compile_velocity: bool = False       # torch.compile 加速 velocity_net
 
 
 @dataclass

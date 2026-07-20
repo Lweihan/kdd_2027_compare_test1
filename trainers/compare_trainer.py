@@ -48,6 +48,34 @@ class CompareTrainer:
         self.output_dir = config.output_dir
         os.makedirs(self.output_dir, exist_ok=True)
 
+        # 多卡配置
+        self.use_multi_gpu = False
+        self.gpu_ids = []
+        if (
+            config.training.multi_gpu
+            and torch.cuda.is_available()
+            and str(device).startswith("cuda")
+        ):
+            available_gpus = torch.cuda.device_count()
+            requested = config.training.gpu_ids if config.training.gpu_ids else list(range(available_gpus))
+            self.gpu_ids = [gid for gid in requested if 0 <= gid < available_gpus]
+            if len(self.gpu_ids) >= 2:
+                self.use_multi_gpu = True
+                logger.info(f"启用多卡训练 DataParallel, GPU IDs: {self.gpu_ids}")
+            else:
+                logger.info("multi_gpu=True 但可用 GPU < 2, 退化为单卡")
+
+    def _maybe_wrap_data_parallel(self, model: nn.Module) -> nn.Module:
+        """按配置将模型包装为 DataParallel"""
+        if self.use_multi_gpu and not isinstance(model, nn.DataParallel):
+            return nn.DataParallel(model, device_ids=self.gpu_ids)
+        return model
+
+    @staticmethod
+    def _unwrap_model(model: nn.Module) -> nn.Module:
+        """获取原始模型 (去除 DataParallel 包装)"""
+        return model.module if isinstance(model, nn.DataParallel) else model
+
     def train_ranker(
         self,
         model: BaseRanker,
@@ -68,6 +96,7 @@ class CompareTrainer:
             dict with training history and best metrics
         """
         model = model.to(self.device)
+        model = self._maybe_wrap_data_parallel(model)
         optimizer = AdamW(
             model.parameters(),
             lr=self.config.training.lr,
@@ -121,7 +150,7 @@ class CompareTrainer:
                 patience_counter = 0
                 # 保存最佳模型
                 save_path = os.path.join(self.output_dir, f"{model_name}_best.pt")
-                torch.save(model.state_dict(), save_path)
+                torch.save(self._unwrap_model(model).state_dict(), save_path)
                 logger.info(f"  ★ 新最佳模型 (val_auc={best_val_auc:.6f})")
             else:
                 patience_counter += 1
@@ -132,7 +161,7 @@ class CompareTrainer:
         # 加载最佳模型
         best_path = os.path.join(self.output_dir, f"{model_name}_best.pt")
         if os.path.exists(best_path):
-            model.load_state_dict(torch.load(best_path, map_location=self.device))
+            self._unwrap_model(model).load_state_dict(torch.load(best_path, map_location=self.device))
 
         # 最终验证
         final_metrics = self._evaluate_ranker(model, val_loader)
@@ -214,6 +243,7 @@ class CompareTrainer:
         """
         model.eval()
         model = model.to(self.device)
+        model = self._maybe_wrap_data_parallel(model)
         all_embeddings = []
         all_labels = []
         all_user_ids = []
@@ -222,7 +252,8 @@ class CompareTrainer:
         with torch.no_grad():
             for batch in tqdm(loader, desc="Extracting embeddings"):
                 sparse_values = {k: v.to(self.device) for k, v in batch["sparse_values"].items()}
-                emb = model.extract_embedding(sparse_values)  # (batch, data_dim)
+                base_model = self._unwrap_model(model)
+                emb = base_model.extract_embedding(sparse_values)  # (batch, data_dim)
 
                 all_embeddings.append(emb.cpu())
                 all_labels.append(batch["label"])
@@ -271,11 +302,27 @@ class CompareTrainer:
             fm_checkpoint=fm_config.fm_checkpoint if fm_config.fm_checkpoint else None,
             freeze_fm=fm_config.freeze_fm,
         ).to(self.device)
-        total_params = sum(p.numel() for p in fm_optimizer.parameters() if p.requires_grad)
+        fm_optimizer = self._maybe_wrap_data_parallel(fm_optimizer)
+        total_params = sum(
+            p.numel() for p in self._unwrap_model(fm_optimizer).parameters() if p.requires_grad
+        )
         logger.info(f"=== 训练 FM 优化器 (model={model_name}, fm_weight={fm_weight}) ===")
         logger.info(f"  FM 模型可训练参数量: {total_params:,}")
         logger.info(f"  FM backbone: {fm_config.backbone_type}")
         logger.info(f"  FM 权重: {fm_weight}")
+        logger.info(f"  快速训练模式: {fm_config.fast_train}")
+        logger.info(f"  AMP: {fm_config.use_amp}")
+
+        # torch.compile 加速 (PyTorch 2.0+)
+        if fm_config.compile_velocity:
+            try:
+                base_fm = self._unwrap_model(fm_optimizer)
+                base_fm.fm_model.velocity_net = torch.compile(
+                    base_fm.fm_model.velocity_net, mode="reduce-overhead"
+                )
+                logger.info(f"  torch.compile: 已启用 (reduce-overhead)")
+            except Exception as e:
+                logger.warning(f"  torch.compile 失败: {e}, 跳过")
 
         optimizer = AdamW(
             fm_optimizer.parameters(),
@@ -284,7 +331,11 @@ class CompareTrainer:
         )
         scheduler = CosineAnnealingLR(optimizer, T_max=fm_config.fm_epochs)
 
+        # AMP scaler
+        scaler = torch.cuda.amp.GradScaler(enabled=fm_config.use_amp)
+
         best_val_auc = 0.0
+        best_epoch = 0
         history = []
         batch_size = fm_config.fm_batch_size
 
@@ -301,22 +352,30 @@ class CompareTrainer:
         for epoch in range(1, fm_config.fm_epochs + 1):
             t0 = time.time()
 
-            # 训练
-            train_stats = self._train_fm_epoch(fm_optimizer, train_emb_loader, optimizer)
+            # 训练 (fast_train + AMP)
+            train_stats = self._train_fm_epoch(
+                fm_optimizer, train_emb_loader, optimizer, scaler
+            )
             scheduler.step()
 
-            # 验证
-            val_metrics = self._evaluate_fm_optimizer(fm_optimizer, val_emb_loader)
+            # 评估 (按 eval_interval 控制频率, 减少耗时)
+            need_eval = (epoch % fm_config.eval_interval == 0) or (epoch == fm_config.fm_epochs)
+            if need_eval:
+                val_metrics = self._evaluate_fm_optimizer(fm_optimizer, val_emb_loader)
+            else:
+                # 轻量代理评估: 跳过 ODE, 直接用 projected embedding 评估
+                val_metrics = self._evaluate_fm_optimizer_fast(fm_optimizer, val_emb_loader)
 
             elapsed = time.time() - t0
             lr = scheduler.get_last_lr()[0]
 
+            eval_tag = "ODE" if need_eval else "fast"
             logger.info(
                 f"FM Epoch {epoch}/{fm_config.fm_epochs} | "
                 f"loss={train_stats['loss']:.6f} "
                 f"fm={train_stats['fm_loss']:.6f} "
                 f"bce={train_stats['bce_loss']:.6f} | "
-                f"val_auc={val_metrics.get('auc', 0):.6f} | "
+                f"val_auc={val_metrics.get('auc', 0):.6f} [{eval_tag}] | "
                 f"lr={lr:.2e} | {elapsed:.1f}s"
             )
 
@@ -331,31 +390,55 @@ class CompareTrainer:
             current_auc = val_metrics.get('auc', 0)
             if current_auc > best_val_auc:
                 best_val_auc = current_auc
+                best_epoch = epoch
                 save_path = os.path.join(self.output_dir, f"fm_{model_name}_w{fm_weight}_best.pt")
-                torch.save(fm_optimizer.state_dict(), save_path)
-                logger.info(f"  ★ 新最佳 FM 模型 (val_auc={best_val_auc:.6f})")
+                torch.save(self._unwrap_model(fm_optimizer).state_dict(), save_path)
+                logger.info(f"  ★ 新最佳 FM 模型 (val_auc={best_val_auc:.6f}, epoch={best_epoch})")
+
+        # 最终用完整 ODE 评估一次 best model
+        logger.info(f"  加载最佳模型 (epoch={best_epoch}) 进行完整 ODE 评估...")
+        save_path = os.path.join(self.output_dir, f"fm_{model_name}_w{fm_weight}_best.pt")
+        if os.path.exists(save_path):
+            self._unwrap_model(fm_optimizer).load_state_dict(torch.load(save_path, map_location=self.device))
+        final_val_metrics = self._evaluate_fm_optimizer(fm_optimizer, val_emb_loader)
+        logger.info(f"  最终 ODE 评估: val_auc={final_val_metrics.get('auc', 0):.6f}")
 
         return fm_optimizer, history
 
-    def _train_fm_epoch(self, fm_optimizer, loader, optimizer) -> Dict:
-        """训练 FM 优化器一个 epoch"""
+    def _train_fm_epoch(self, fm_optimizer, loader, optimizer, scaler=None) -> Dict:
+        """训练 FM 优化器一个 epoch (支持 fast_train + AMP)"""
         fm_optimizer.train()
+        use_amp = self.config.fm_optimizer.use_amp and scaler is not None
+        fast_train = self.config.fm_optimizer.fast_train
+
         total_loss = 0.0
         total_fm_loss = 0.0
         total_bce_loss = 0.0
         n = 0
 
         for embeddings, labels in loader:
-            embeddings = embeddings.to(self.device)
-            labels = labels.to(self.device)
+            embeddings = embeddings.to(self.device, non_blocking=True)
+            labels = labels.to(self.device, non_blocking=True)
 
-            loss_dict = fm_optimizer.compute_total_loss(embeddings, labels)
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                base_fm = self._unwrap_model(fm_optimizer)
+                loss_dict = base_fm.compute_total_loss(
+                    embeddings, labels, fast_train=fast_train
+                )
 
-            optimizer.zero_grad()
-            loss_dict['loss'].backward()
-            if self.config.fm_optimizer.fm_grad_clip > 0:
-                nn.utils.clip_grad_norm_(fm_optimizer.parameters(), self.config.fm_optimizer.fm_grad_clip)
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            if use_amp:
+                scaler.scale(loss_dict['loss']).backward()
+                if self.config.fm_optimizer.fm_grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    nn.utils.clip_grad_norm_(fm_optimizer.parameters(), self.config.fm_optimizer.fm_grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss_dict['loss'].backward()
+                if self.config.fm_optimizer.fm_grad_clip > 0:
+                    nn.utils.clip_grad_norm_(fm_optimizer.parameters(), self.config.fm_optimizer.fm_grad_clip)
+                optimizer.step()
 
             total_loss += loss_dict['loss'].item()
             total_fm_loss += loss_dict['fm_loss']
@@ -367,6 +450,33 @@ class CompareTrainer:
             'fm_loss': total_fm_loss / max(n, 1),
             'bce_loss': total_bce_loss / max(n, 1),
         }
+
+    @torch.no_grad()
+    def _evaluate_fm_optimizer_fast(self, fm_optimizer, loader) -> Dict:
+        """快速评估: 跳过 ODE, 直接用 projected embedding 评估 (用于中间 epoch)"""
+        fm_optimizer.eval()
+        all_preds = []
+        all_labels = []
+
+        for embeddings, labels in loader:
+            embeddings = embeddings.to(self.device)
+            # 跳过 ODE, 直接用 projected embedding → pred_head
+            projected = self._unwrap_model(fm_optimizer).project_input(embeddings)
+            logit = self._unwrap_model(fm_optimizer).pred_head(projected).squeeze(-1)
+            pred = torch.sigmoid(logit)
+
+            all_preds.append(pred.cpu().numpy())
+            all_labels.append(labels.numpy())
+
+        y_pred = np.concatenate(all_preds)
+        y_true = np.concatenate(all_labels)
+
+        return evaluate_predictions(
+            y_true=y_true,
+            y_pred=y_pred,
+            metrics=self.config.evaluation.metrics,
+            ndcg_k=self.config.evaluation.ndcg_k,
+        )
 
     @torch.no_grad()
     def _evaluate_fm_optimizer(self, fm_optimizer, loader) -> Dict:
