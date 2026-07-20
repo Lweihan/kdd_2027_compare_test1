@@ -61,13 +61,19 @@ class CompareTrainer:
             self.gpu_ids = [gid for gid in requested if 0 <= gid < available_gpus]
             if len(self.gpu_ids) >= 2:
                 self.use_multi_gpu = True
-                logger.info(f"启用多卡训练 DataParallel, GPU IDs: {self.gpu_ids}")
+                # DataParallel 要求模型在 device_ids[0] 上, 同时输入数据也必须发往该设备
+                self.device = f"cuda:{self.gpu_ids[0]}"
+                logger.info(f"启用多卡训练 DataParallel, GPU IDs: {self.gpu_ids}, 主设备: {self.device}")
             else:
                 logger.info("multi_gpu=True 但可用 GPU < 2, 退化为单卡")
 
     def _maybe_wrap_data_parallel(self, model: nn.Module) -> nn.Module:
-        """按配置将模型包装为 DataParallel"""
+        """按配置将模型包装为 DataParallel。
+        DataParallel 要求模型参数已在 device_ids[0] 上,
+        所以先将模型移至主设备再包装。
+        """
         if self.use_multi_gpu and not isinstance(model, nn.DataParallel):
+            model = model.to(f"cuda:{self.gpu_ids[0]}")
             return nn.DataParallel(model, device_ids=self.gpu_ids)
         return model
 
