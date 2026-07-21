@@ -132,6 +132,9 @@ class FMOptimizerConfig:
     eval_interval: int = 1              # 评估间隔 (每 N 个 epoch 评估一次)
     use_amp: bool = False               # 混合精度训练 (AMP)
     compile_velocity: bool = False       # torch.compile 加速 velocity_net
+    compile_full: bool = False           # torch.compile 加速整个 FMOptimizer
+    grad_accum_steps: int = 1           # 梯度累积步数 (增大等效 batch_size)
+    gradient_checkpointing: bool = False # 梯度检查点 (省显存, 慢一点)
 
 
 @dataclass

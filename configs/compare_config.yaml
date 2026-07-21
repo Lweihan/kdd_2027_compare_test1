@@ -119,6 +119,9 @@ fm_optimizer:
   eval_interval: 1             # 完整 ODE 评估间隔 (每 N 个 epoch; >1 时中间用快速代理评估)
   use_amp: true                # 混合精度训练 (AMP, 需 GPU)
   compile_velocity: false      # torch.compile 加速 velocity_net (需 PyTorch 2.0+)
+  compile_full: false         # torch.compile 加速整个 FMOptimizer (更激进)
+  grad_accum_steps: 1         # 梯度累积步数 (等效 batch = fm_batch_size * grad_accum_steps)
+  gradient_checkpointing: false # 梯度检查点 (省显存, 略慢, 适合 no_freeze_fm 大模型)
 
 # ──────────────────────────────────────────────────
 # Evaluation Configuration

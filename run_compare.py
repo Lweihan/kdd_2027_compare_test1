@@ -18,6 +18,7 @@ import argparse
 import logging
 import json
 import time
+import numpy as np
 from typing import List
 
 from utils.config import CompareConfig
@@ -47,6 +48,17 @@ MODEL_REGISTRY = {
 }
 
 ALL_MODELS = list(MODEL_REGISTRY.keys())
+
+
+def _json_default(obj):
+    """JSON 序列化回退: 处理 numpy / torch 数值类型"""
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
 def create_model(model_name: str, config: CompareConfig, sparse_feature_names, feature_voc_sizes):
@@ -115,6 +127,14 @@ def main():
                         help="启用多卡训练 (DataParallel)")
     parser.add_argument("--gpu_ids", nargs="+", type=int, default=None,
                         help="指定 GPU IDs (如: --gpu_ids 0 1 2 3)")
+    parser.add_argument("--batch_size", type=int, default=None,
+                        help="统一 batch_size (同时覆盖 ranker 和 FM optimizer)")
+    parser.add_argument("--fm_batch_size", type=int, default=None,
+                        help="FM optimizer batch_size (单独指定, 优先于 --batch_size)")
+    parser.add_argument("--grad_accum_steps", type=int, default=None,
+                        help="梯度累积步数 (增大等效 batch_size 而不增加显存)")
+    parser.add_argument("--compile_model", action="store_true", default=False,
+                        help="启用 torch.compile 加速整个 FMOptimizer (比 --compile 更激进)")
     args = parser.parse_args()
 
     # 加载配置
@@ -142,6 +162,16 @@ def main():
         config.training.multi_gpu = True
     if args.gpu_ids is not None:
         config.training.gpu_ids = args.gpu_ids
+    # batch_size: --batch_size 覆盖两个, --fm_batch_size 只覆盖 FM
+    if args.batch_size is not None:
+        config.dataset.batch_size = args.batch_size
+        config.fm_optimizer.fm_batch_size = args.batch_size
+    if args.fm_batch_size is not None:
+        config.fm_optimizer.fm_batch_size = args.fm_batch_size
+    if args.grad_accum_steps is not None:
+        config.fm_optimizer.grad_accum_steps = args.grad_accum_steps
+    if args.compile_model:
+        config.fm_optimizer.compile_full = True
     if args.fm_checkpoint:
         config.fm_optimizer.fm_checkpoint = args.fm_checkpoint
     if args.no_freeze_fm:
@@ -173,6 +203,11 @@ def main():
     logger.info(f"多卡训练: {config.training.multi_gpu}")
     if config.training.multi_gpu:
         logger.info(f"GPU IDs: {config.training.gpu_ids if config.training.gpu_ids else '全部可见 GPU'}")
+    logger.info(f"Ranker batch_size: {config.dataset.batch_size}")
+    logger.info(f"FM batch_size: {config.fm_optimizer.fm_batch_size}")
+    if config.fm_optimizer.grad_accum_steps > 1:
+        logger.info(f"梯度累积: {config.fm_optimizer.grad_accum_steps} 步 "
+                    f"(等效 FM batch_size={config.fm_optimizer.fm_batch_size * config.fm_optimizer.grad_accum_steps})")
     logger.info(f"随机种子: {config.seed}")
     logger.info(f"输出目录: {config.output_dir}")
 
@@ -270,7 +305,7 @@ def main():
     # 保存汇总结果
     summary_path = os.path.join(config.output_dir, "all_comparison_summary.json")
     with open(summary_path, 'w') as f:
-        json.dump(summary, f, indent=2)
+        json.dump(summary, f, indent=2, default=_json_default)
     logger.info(f"\n汇总结果已保存: {summary_path}")
 
     # 打印最终对比表

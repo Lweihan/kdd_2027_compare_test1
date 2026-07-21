@@ -29,6 +29,19 @@ from models.fm_optimizer import FMOptimizer
 logger = logging.getLogger(__name__)
 
 
+def _json_default(obj):
+    """JSON 序列化回退: 处理 numpy / torch 数值类型"""
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (torch.Tensor,)):
+        return obj.item()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
 class CompareTrainer:
     """
     对比实验训练器。
@@ -186,14 +199,16 @@ class CompareTrainer:
         total_loss = 0.0
         n = 0
 
-        for batch in loader:
-            sparse_values = {k: v.to(self.device) for k, v in batch["sparse_values"].items()}
-            labels = batch["label"].to(self.device)
+        pbar = tqdm(loader, desc="Ranker train", leave=False,
+                     unit="batch", mininterval=0.5)
+        for batch in pbar:
+            sparse_values = {k: v.to(self.device, non_blocking=True) for k, v in batch["sparse_values"].items()}
+            labels = batch["label"].to(self.device, non_blocking=True)
 
             pred = model(sparse_values)  # logits (AMP-safe)
             loss = F.binary_cross_entropy_with_logits(pred, labels)
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
             if self.config.training.grad_clip > 0:
                 nn.utils.clip_grad_norm_(model.parameters(), self.config.training.grad_clip)
@@ -201,6 +216,7 @@ class CompareTrainer:
 
             total_loss += loss.item()
             n += 1
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
 
         return total_loss / max(n, 1)
 
@@ -212,8 +228,9 @@ class CompareTrainer:
         all_labels = []
         all_user_ids = []
 
-        for batch in loader:
-            sparse_values = {k: v.to(self.device) for k, v in batch["sparse_values"].items()}
+        for batch in tqdm(loader, desc="Ranker eval", leave=False,
+                          unit="batch", mininterval=0.5):
+            sparse_values = {k: v.to(self.device, non_blocking=True) for k, v in batch["sparse_values"].items()}
             logit = model(sparse_values)  # logits
             pred = torch.sigmoid(logit)    # → probability
 
@@ -319,6 +336,12 @@ class CompareTrainer:
         logger.info(f"  FM 权重: {fm_weight}")
         logger.info(f"  快速训练模式: {fm_config.fast_train}")
         logger.info(f"  AMP: {fm_config.use_amp}")
+        logger.info(f"  梯度累积: {fm_config.grad_accum_steps} 步")
+        if fm_config.grad_accum_steps > 1:
+            logger.info(f"  等效 batch_size: {fm_config.fm_batch_size * fm_config.grad_accum_steps}")
+        logger.info(f"  compile_velocity: {fm_config.compile_velocity}")
+        logger.info(f"  compile_full: {fm_config.compile_full}")
+        logger.info(f"  gradient_checkpointing: {fm_config.gradient_checkpointing}")
 
         # torch.compile 加速 (PyTorch 2.0+)
         if fm_config.compile_velocity:
@@ -327,9 +350,28 @@ class CompareTrainer:
                 base_fm.fm_model.velocity_net = torch.compile(
                     base_fm.fm_model.velocity_net, mode="reduce-overhead"
                 )
-                logger.info(f"  torch.compile: 已启用 (reduce-overhead)")
+                logger.info(f"  torch.compile (velocity_net): 已启用")
             except Exception as e:
                 logger.warning(f"  torch.compile 失败: {e}, 跳过")
+
+        # 编译整个 FMOptimizer (更激进)
+        if fm_config.compile_full:
+            try:
+                base_fm = self._unwrap_model(fm_optimizer)
+                base_fm.compute_total_loss = torch.compile(
+                    base_fm.compute_total_loss, mode="reduce-overhead"
+                )
+                logger.info(f"  torch.compile (full model): 已启用")
+            except Exception as e:
+                logger.warning(f"  torch.compile (full) 失败: {e}, 跳过")
+
+        # 梯度检查点 (省显存, 适合 no_freeze_fm 大模型)
+        if fm_config.gradient_checkpointing:
+            base_fm = self._unwrap_model(fm_optimizer)
+            if hasattr(base_fm.fm_model.velocity_net, 'transformer'):
+                # Transformer 版本: 对 TransformerEncoder 启用检查点
+                base_fm.fm_model.velocity_net.transformer.gradient_checkpointing_enable()
+            logger.info(f"  梯度检查点: 已启用 (省显存, 略慢)")
 
         optimizer = AdamW(
             fm_optimizer.parameters(),
@@ -413,17 +455,20 @@ class CompareTrainer:
         return fm_optimizer, history
 
     def _train_fm_epoch(self, fm_optimizer, loader, optimizer, scaler=None) -> Dict:
-        """训练 FM 优化器一个 epoch (支持 fast_train + AMP)"""
+        """训练 FM 优化器一个 epoch (支持 fast_train + AMP + 梯度累积)"""
         fm_optimizer.train()
         use_amp = self.config.fm_optimizer.use_amp and scaler is not None
         fast_train = self.config.fm_optimizer.fast_train
+        accum_steps = self.config.fm_optimizer.grad_accum_steps
 
         total_loss = 0.0
         total_fm_loss = 0.0
         total_bce_loss = 0.0
         n = 0
 
-        for embeddings, labels in loader:
+        pbar = tqdm(loader, desc="FM train", leave=False,
+                     unit="batch", mininterval=0.5)
+        for step, (embeddings, labels) in enumerate(pbar):
             embeddings = embeddings.to(self.device, non_blocking=True)
             labels = labels.to(self.device, non_blocking=True)
 
@@ -432,25 +477,39 @@ class CompareTrainer:
                 loss_dict = base_fm.compute_total_loss(
                     embeddings, labels, fast_train=fast_train
                 )
+                # 梯度累积: 缩放损失
+                scaled_loss = loss_dict['loss'] / accum_steps
 
-            optimizer.zero_grad(set_to_none=True)
+            # 反向传播 (累积梯度)
             if use_amp:
-                scaler.scale(loss_dict['loss']).backward()
-                if self.config.fm_optimizer.fm_grad_clip > 0:
-                    scaler.unscale_(optimizer)
-                    nn.utils.clip_grad_norm_(fm_optimizer.parameters(), self.config.fm_optimizer.fm_grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
+                scaler.scale(scaled_loss).backward()
             else:
-                loss_dict['loss'].backward()
-                if self.config.fm_optimizer.fm_grad_clip > 0:
-                    nn.utils.clip_grad_norm_(fm_optimizer.parameters(), self.config.fm_optimizer.fm_grad_clip)
-                optimizer.step()
+                scaled_loss.backward()
+
+            # 每 accum_steps 步更新一次参数
+            if (step + 1) % accum_steps == 0 or (step + 1) == len(loader):
+                if use_amp:
+                    if self.config.fm_optimizer.fm_grad_clip > 0:
+                        scaler.unscale_(optimizer)
+                        nn.utils.clip_grad_norm_(fm_optimizer.parameters(), self.config.fm_optimizer.fm_grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    if self.config.fm_optimizer.fm_grad_clip > 0:
+                        nn.utils.clip_grad_norm_(fm_optimizer.parameters(), self.config.fm_optimizer.fm_grad_clip)
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
             total_loss += loss_dict['loss'].item()
             total_fm_loss += loss_dict['fm_loss']
             total_bce_loss += loss_dict['bce_loss']
             n += 1
+
+            pbar.set_postfix(
+                loss=f"{loss_dict['loss'].item():.4f}",
+                fm=f"{loss_dict['fm_loss']:.4f}",
+                bce=f"{loss_dict['bce_loss']:.4f}",
+            )
 
         return {
             'loss': total_loss / max(n, 1),
@@ -465,8 +524,9 @@ class CompareTrainer:
         all_preds = []
         all_labels = []
 
-        for embeddings, labels in loader:
-            embeddings = embeddings.to(self.device)
+        for embeddings, labels in tqdm(loader, desc="FM eval (fast)", leave=False,
+                                        unit="batch", mininterval=0.5):
+            embeddings = embeddings.to(self.device, non_blocking=True)
             # 跳过 ODE, 直接用 projected embedding → pred_head
             projected = self._unwrap_model(fm_optimizer).project_input(embeddings)
             logit = self._unwrap_model(fm_optimizer).pred_head(projected).squeeze(-1)
@@ -492,8 +552,9 @@ class CompareTrainer:
         all_preds = []
         all_labels = []
 
-        for embeddings, labels in loader:
-            embeddings = embeddings.to(self.device)
+        for embeddings, labels in tqdm(loader, desc="FM eval (ODE)", leave=False,
+                                        unit="batch", mininterval=0.5):
+            embeddings = embeddings.to(self.device, non_blocking=True)
             pred = fm_optimizer(embeddings)
 
             all_preds.append(pred.cpu().numpy())
@@ -601,8 +662,9 @@ class CompareTrainer:
                 )
 
                 all_preds = []
-                for emb_batch, _ in test_emb_loader:
-                    emb_batch = emb_batch.to(self.device)
+                for emb_batch, _ in tqdm(test_emb_loader, desc="FM test", leave=False,
+                                          unit="batch", mininterval=0.5):
+                    emb_batch = emb_batch.to(self.device, non_blocking=True)
                     pred = fm_optimizer(emb_batch)
                     all_preds.append(pred.cpu().numpy())
 
@@ -630,7 +692,7 @@ class CompareTrainer:
         # 保存结果
         result_path = os.path.join(self.output_dir, f"{model_name}_comparison.json")
         with open(result_path, 'w') as f:
-            json.dump(results, f, indent=2)
+            json.dump(results, f, indent=2, default=_json_default)
         logger.info(f"结果已保存: {result_path}")
 
         return results
