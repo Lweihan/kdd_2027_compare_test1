@@ -135,6 +135,9 @@ class FMOptimizerConfig:
     compile_full: bool = False           # torch.compile 加速整个 FMOptimizer
     grad_accum_steps: int = 1           # 梯度累积步数 (增大等效 batch_size)
     gradient_checkpointing: bool = False # 梯度检查点 (省显存, 慢一点)
+    # 联合训练
+    joint_train: bool = False            # 启用联合训练 (ranker + FM 端到端)
+    joint_alpha: float = 0.5             # 直接预测损失权重 (0~1)
 
 
 @dataclass

@@ -23,6 +23,7 @@ from typing import List
 
 from utils.config import CompareConfig
 from utils.seed import set_seed
+from utils.metrics import evaluate_predictions
 from data.mac_dataset import load_mac_data, get_mac_dataloaders
 from models.dnn import DNN
 from models.wide_deep import WideDeep
@@ -135,6 +136,12 @@ def main():
                         help="梯度累积步数 (增大等效 batch_size 而不增加显存)")
     parser.add_argument("--compile_model", action="store_true", default=False,
                         help="启用 torch.compile 加速整个 FMOptimizer (比 --compile 更激进)")
+    parser.add_argument("--joint_train", action="store_true", default=False,
+                        help="启用联合训练模式 (ranker + FM 端到端一起训练)")
+    parser.add_argument("--skip_baseline", action="store_true", default=False,
+                        help="跳过基础模型直接预测阶段 (仅训练联合模型或 FM 优化)")
+    parser.add_argument("--joint_alpha", type=float, default=None,
+                        help="联合训练中直接预测损失权重 α (0~1, 默认 0.5)")
     args = parser.parse_args()
 
     # 加载配置
@@ -172,6 +179,11 @@ def main():
         config.fm_optimizer.grad_accum_steps = args.grad_accum_steps
     if args.compile_model:
         config.fm_optimizer.compile_full = True
+    # 联合训练配置
+    if args.joint_train:
+        config.fm_optimizer.joint_train = True
+    if args.joint_alpha is not None:
+        config.fm_optimizer.joint_alpha = args.joint_alpha
     if args.fm_checkpoint:
         config.fm_optimizer.fm_checkpoint = args.fm_checkpoint
     if args.no_freeze_fm:
@@ -199,6 +211,8 @@ def main():
     logger.info(f"FM checkpoint: {config.fm_optimizer.fm_checkpoint or '无 (从头训练)'}")
     if config.fm_optimizer.fm_checkpoint:
         logger.info(f"FM freeze: {config.fm_optimizer.freeze_fm}")
+    logger.info(f"联合训练: {config.fm_optimizer.joint_train}")
+    logger.info(f"跳过基线: {args.skip_baseline}")
     logger.info(f"设备: {device}")
     logger.info(f"多卡训练: {config.training.multi_gpu}")
     if config.training.multi_gpu:
@@ -270,15 +284,82 @@ def main():
         # 创建模型
         model = create_model(model_name, config, sparse_feature_names, feature_voc_sizes)
 
-        # 运行对比
-        results = trainer.run_comparison(
-            model=model,
-            model_name=model_name,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            test_loader=test_loader,
-            fm_weights=args.fm_weights,
-        )
+        # 根据模式选择运行方式
+        use_joint = config.fm_optimizer.joint_train
+        skip_base = args.skip_baseline
+
+        if use_joint:
+            # 联合训练模式: ranker + FM 端到端
+            results = trainer.run_joint_comparison(
+                model=model,
+                model_name=model_name,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                test_loader=test_loader,
+                fm_weights=args.fm_weights,
+            )
+        elif skip_base:
+            # 跳过基线: 只训练 FM 优化器 (需先训练 ranker 再冻结)
+            logger.info(f"跳过基线直接预测, 仅训练 FM 优化器")
+            # 仍然需要先训练 ranker 以提取 embeddings
+            trainer.train_ranker(model, train_loader, val_loader, model_name)
+            # 提取 embeddings
+            train_emb, train_labels, train_labels_np, train_user_ids = \
+                trainer.extract_embeddings(model, train_loader)
+            val_emb, val_labels, val_labels_np, val_user_ids = \
+                trainer.extract_embeddings(model, val_loader)
+            test_emb, test_labels, test_labels_np, test_user_ids = \
+                trainer.extract_embeddings(model, test_loader)
+
+            results = {'model_name': model_name, 'direct': {}, 'fm_optimized': {}}
+            # 直接预测结果
+            test_metrics_direct = trainer._evaluate_ranker(model, test_loader)
+            results['direct'] = test_metrics_direct
+
+            input_dim = train_emb.shape[-1]
+            fm_weights = args.fm_weights or [0.1, 0.5, 1.0, 2.0]
+            for fm_weight in fm_weights:
+                fm_opt, fm_history = trainer.train_fm_optimizer(
+                    train_embeddings=train_emb,
+                    train_labels=train_labels,
+                    val_embeddings=val_emb,
+                    val_labels=val_labels,
+                    model_name=model_name,
+                    fm_weight=fm_weight,
+                    input_dim=input_dim,
+                )
+                # 评估
+                fm_opt.eval()
+                with torch.no_grad():
+                    test_ds = torch.utils.data.TensorDataset(test_emb, test_labels)
+                    test_emb_loader = torch.utils.data.DataLoader(
+                        test_ds, batch_size=config.fm_optimizer.fm_batch_size,
+                        shuffle=False, pin_memory=True,
+                    )
+                    all_preds = []
+                    for emb_batch, _ in test_emb_loader:
+                        emb_batch = emb_batch.to(trainer.device, non_blocking=True)
+                        pred = fm_opt(emb_batch)
+                        all_preds.append(pred.cpu().numpy())
+                    y_pred = np.concatenate(all_preds)
+
+                fm_metrics = evaluate_predictions(
+                    y_true=test_labels_np, y_pred=y_pred,
+                    user_ids=test_user_ids,
+                    metrics=config.evaluation.metrics,
+                    ndcg_k=config.evaluation.ndcg_k,
+                )
+                results['fm_optimized'][f'fm_weight_{fm_weight}'] = fm_metrics
+        else:
+            # 标准模式: 分开训练
+            results = trainer.run_comparison(
+                model=model,
+                model_name=model_name,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                test_loader=test_loader,
+                fm_weights=args.fm_weights,
+            )
         all_results[model_name] = results
 
     # ──────────────────────────────────────────

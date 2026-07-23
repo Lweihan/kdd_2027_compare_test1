@@ -122,6 +122,9 @@ fm_optimizer:
   compile_full: false         # torch.compile 加速整个 FMOptimizer (更激进)
   grad_accum_steps: 1         # 梯度累积步数 (等效 batch = fm_batch_size * grad_accum_steps)
   gradient_checkpointing: false # 梯度检查点 (省显存, 略慢, 适合 no_freeze_fm 大模型)
+  # ── 联合训练 ──
+  joint_train: false            # 启用联合训练模式 (ranker + FM 端到端一起训练)
+  joint_alpha: 0.5              # 直接预测损失权重 α (0~1; L = α*L_direct + (1-α)*L_FM)
 
 # ──────────────────────────────────────────────────
 # Evaluation Configuration
